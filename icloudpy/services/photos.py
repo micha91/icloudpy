@@ -1,32 +1,49 @@
 """Photo service."""
 
 import base64
+import dataclasses
 import json
 import logging
+import os
+import plistlib
+import zlib
+from collections.abc import Generator, Sequence
 from datetime import datetime
+from typing import Any, Optional, cast
 
 # fmt: off
 from urllib.parse import urlencode  # pylint: disable=bad-option-value,relative-import
 
+import dateutil.tz
 from pytz import UTC
 from six import PY2
 
 # fmt: on
 from icloudpy.exceptions import ICloudPyServiceNotActivatedException
+from icloudpy.photo_versions import (
+    ITEM_TYPE_EXTENSIONS,
+    ITEM_TYPES,
+    PHOTO_VERSION_LOOKUP,
+    VIDEO_VERSION_LOOKUP,
+    AssetItemType,
+    AssetVersion,
+    AssetVersionSize,
+    VersionSize,
+)
 
 LOGGER = logging.getLogger(__name__)
 
 
 class PhotoLibrary:
-    """Represents a library in the user's photos.
+    """Represents a library in the user"s photos.
 
     This provides access to all the albums as well as the photos.
     """
 
     SMART_FOLDERS = {
         "All Photos": {
-            "obj_type": "CPLAssetByAddedDate",
-            "list_type": "CPLAssetAndMasterByAddedDate",
+            "obj_type": "CPLAssetByAssetDateWithoutHiddenOrDeleted",
+            "list_type": "CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
             "direction": "ASCENDING",
             "query_filter": None,
         },
@@ -134,11 +151,11 @@ class PhotoLibrary:
         },
     }
 
-    def __init__(self, service, zone_id):
+    def __init__(self, service: "PhotosService", zone_id: dict[str, Any]):
         self.service = service
         self.zone_id = zone_id
 
-        self._albums = None
+        self._albums: Optional[dict[str, PhotoAlbum]] = None
 
         url = f"{self.service._service_endpoint}/records/query?{urlencode(self.service.params)}"
         json_data = json.dumps(
@@ -157,12 +174,12 @@ class PhotoLibrary:
         indexing_state = response["records"][0]["fields"]["state"]["value"]
         if indexing_state != "FINISHED":
             raise ICloudPyServiceNotActivatedException(
-                ("iCloud Photo Library not finished indexing.  Please try " "again in a few minutes"),
+                ("iCloud Photo Library not finished indexing.  Please try again in a few minutes"),
                 None,
             )
 
     @property
-    def albums(self):
+    def albums(self) -> dict[str, "PhotoAlbum"]:
         if not self._albums:
             self._albums = {
                 name: PhotoAlbum(self.service, name, zone_id=self.zone_id, **props)
@@ -203,7 +220,7 @@ class PhotoLibrary:
 
         return self._albums
 
-    def _fetch_folders(self):
+    def _fetch_folders(self) -> Sequence[dict[str, Any]]:
         url = f"{self.service._service_endpoint}/records/query?{urlencode(self.service.params)}"
         json_data = json.dumps(
             {
@@ -219,7 +236,7 @@ class PhotoLibrary:
         )
         response = request.json()
 
-        return response["records"]
+        return cast(Sequence[dict[str, Any]], response["records"])
 
     @property
     def all(self):
@@ -227,18 +244,23 @@ class PhotoLibrary:
 
 
 class PhotosService(PhotoLibrary):
-    """The 'Photos' iCloud service.
+    """The "Photos" iCloud service.
 
-    This also acts as a way to access the user's primary library.
+    This also acts as a way to access the user"s primary library.
     """
 
-    def __init__(self, service_root, session, params):
+    def __init__(
+        self,
+        service_root: str,
+        session,
+        params: dict[str, Any],
+    ):
         self.session = session
         self.params = dict(params)
         self._service_root = service_root
         self._service_endpoint = f"{self._service_root}/database/1/com.apple.photos.cloud/production/private"
 
-        self._libraries = None
+        self._libraries: Optional[dict[str, PhotoLibrary]] = None
 
         self.params.update({"remapEnums": True, "getCurrentSyncToken": True})
 
@@ -247,7 +269,7 @@ class PhotosService(PhotoLibrary):
         super().__init__(service=self, zone_id={"zoneName": "PrimarySync"})
 
     @property
-    def libraries(self):
+    def libraries(self) -> dict[str, PhotoLibrary]:
         if not self._libraries:
             try:
                 url = f"{self._service_endpoint}/zones/list"
@@ -266,10 +288,10 @@ class PhotosService(PhotoLibrary):
                 if not zone.get("deleted"):
                     zone_name = zone["zoneID"]["zoneName"]
                     libraries[zone_name] = PhotoLibrary(self, zone_id=zone["zoneID"])
-                    # obj_type='CPLAssetByAssetDateWithoutHiddenOrDeleted',
+                    # obj_type="CPLAssetByAssetDateWithoutHiddenOrDeleted",
                     # list_type="CPLAssetAndMasterByAssetDateWithoutHiddenOrDeleted",
                     # direction="ASCENDING", query_filter=None,
-                    # zone_id=zone['zoneID'])
+                    # zone_id=zone["zoneID"])
 
             self._libraries = libraries
 
@@ -301,9 +323,9 @@ class PhotoAlbum:
         self.folder_id = folder_id
 
         if zone_id:
-            self._zone_id = zone_id
+            self._zone_id: dict[str, Any] = zone_id
         else:
-            self._zone_id = "PrimarySync"
+            self._zone_id = {"zoneName": "PrimarySync"}
 
         self._len = None
 
@@ -423,7 +445,7 @@ class PhotoAlbum:
         return self._subalbums
 
     @property
-    def photos(self):
+    def photos(self) -> Generator["PhotoAsset", Any, None]:
         """Returns the album photos."""
         if self.direction == "DESCENDING":
             offset = len(self) - 1
@@ -594,6 +616,9 @@ class PhotoAlbum:
                 "importedByBundleIdentifierEnc",
                 "importedByDisplayNameEnc",
                 "importedBy",
+                "keywordsEnc",
+                "adjustedMediaMetaDataEnc",
+                "adjustmentSimpleDataEnc",
             ],
             "zoneID": self._zone_id,
         }
@@ -616,33 +641,121 @@ class PhotoAlbum:
         return f"<{type(self).__name__}: '{self}'>"
 
 
+@dataclasses.dataclass
+class GpsData:
+    gps_altitude: float | None = None
+    gps_latitude: float | None = None
+    gps_longitude: float | None = None
+    gps_speed: float | None = None
+    gps_timestamp: datetime | None = None
+
+
 class PhotoAsset:
     """A photo."""
 
-    def __init__(self, service, master_record, asset_record):
+    def __init__(self, service: PhotosService, master_record: dict[str, Any], asset_record: dict[str, Any]) -> None:
         self._service = service
         self._master_record = master_record
         self._asset_record = asset_record
 
-        self._versions = None
+        self._versions: Optional[dict[VersionSize, AssetVersion]] = None
+        self._title = None
+        self._filename = None
+        self._description = None
+        self._adjustments = None
+        self._keywords = None
+        self._location = None
+        self._asset_date = None
 
-    PHOTO_VERSION_LOOKUP = {
-        "full": "resJPEGFull",
-        "large": "resJPEGLarge",
-        "medium": "resJPEGMed",
-        "thumb": "resJPEGThumb",
-        "sidecar": "resSidecar",
-        "original": "resOriginal",
-        "original_alt": "resOriginalAlt",
-    }
+    @property
+    def title(self):
+        if self._title is None and "captionEnc" in self._asset_record["fields"]:
+            self._title = base64.b64decode(self._asset_record["fields"]["captionEnc"]["value"]).decode("utf-8")
 
-    VIDEO_VERSION_LOOKUP = {
-        "full": "resVidFull",
-        "medium": "resVidMed",
-        "thumb": "resVidSmall",
-        "original": "resOriginal",
-        "original_compl": "resOriginalVidCompl",
-    }
+        return self._title
+
+    @property
+    def description(self):
+        if self._description is None and "extendedDescEnc" in self._asset_record["fields"]:
+            self._description = base64.b64decode(self._asset_record["fields"]["extendedDescEnc"]["value"]).decode(
+                "utf-8"
+            )
+
+        return self._description
+
+    @property
+    def adjustments(self):
+        # adjustementSimpleDataEnc can be one of three formats:
+        # - a binary plist - starting with 'bplist00' ( YnBsaXN0MD once encoded), seemingly used for some videos
+        #   metadata (slow motion range etc.)
+        # - a CRDT (Conflict-free Replicated Data Types) - starting with 'crdt' (Y3JkdA once encoded) - used for
+        #   drawings and annotations on photos and screenshots
+        # - a zlib compressed JSON - used for simple photo metadata adjustments (orientation etc.)
+        # for exporting metadata, we only consider the JSON data, but it's the only one that doesn't have a predictable
+        # start pattern, so we check by excluding the other two
+        if self._adjustments is None and (
+            "adjustmentSimpleDataEnc" in self._asset_record["fields"]
+            and not self._asset_record["fields"]["adjustmentSimpleDataEnc"]["value"].startswith("Y3JkdA")  # "crdt"
+            and not self._asset_record["fields"]["adjustmentSimpleDataEnc"]["value"].startswith("YnBsaXN0MD")
+        ):  # "bplist00"
+            self._adjustments = json.loads(
+                zlib.decompress(
+                    base64.b64decode(self._asset_record["fields"]["adjustmentSimpleDataEnc"]["value"]),
+                    -zlib.MAX_WBITS,
+                )
+            )
+
+        return self._adjustments
+
+    @property
+    def keywords(self):
+        if (
+            self._keywords is None
+            and "keywordsEnc" in self._asset_record["fields"]
+            and len(self._asset_record["fields"]["keywordsEnc"]) > 0
+        ):
+            self._keywords = plistlib.loads(
+                base64.b64decode(self._asset_record["fields"]["keywordsEnc"]["value"]),
+            )
+
+        return self._keywords
+
+    @property
+    def location(self):
+        if self._location is None:
+            self._location = GpsData()
+            if "locationEnc" in self._asset_record["fields"]:
+                location = plistlib.loads(
+                    base64.b64decode(self._asset_record["fields"]["locationEnc"]["value"]),
+                )
+                self._location.gps_altitude = location.get("alt")
+                self._location.gps_latitude = location.get("lat")
+                self._location.gps_longitude = location.get("lon")
+                self._location.gps_speed = location.get("speed")
+                self._location.gps_timestamp = (
+                    location.get("timestamp") if isinstance(location.get("timestamp"), datetime) else None
+                )
+
+        return self._location
+
+    @property
+    def is_hidden(self) -> bool:
+        return "isHidden" in self._asset_record["fields"] and self._asset_record["fields"]["isHidden"]["value"] == 1
+
+    @property
+    def is_deleted(self) -> bool:
+        return "isDeleted" in self._asset_record["fields"] and self._asset_record["fields"]["isDeleted"]["value"] == 1
+
+    @property
+    def is_favorite(self) -> bool:
+        return "isFavorite" in self._asset_record["fields"] and self._asset_record["fields"]["isFavorite"]["value"] == 1
+
+    @property
+    def is_screenshot(self) -> bool:
+        return (
+            "assetSubtypeV2" in self._asset_record["fields"]
+            and int(self._asset_record["fields"]["assetSubtypeV2"]["value"]) == 3
+        )
 
     @property
     def id(self):
@@ -652,9 +765,12 @@ class PhotoAsset:
     @property
     def filename(self):
         """Gets the photo file name."""
-        return base64.b64decode(
-            self._master_record["fields"]["filenameEnc"]["value"],
-        ).decode("utf-8")
+        if not self._filename:
+            self._filename = base64.b64decode(
+                self._master_record["fields"]["filenameEnc"]["value"],
+            ).decode("utf-8")
+
+        return self._filename
 
     @property
     def size(self):
@@ -669,13 +785,19 @@ class PhotoAsset:
     @property
     def asset_date(self):
         """Gets the photo asset date."""
-        try:
-            return datetime.fromtimestamp(
-                self._asset_record["fields"]["assetDate"]["value"] / 1000.0,
-                tz=UTC,
-            )
-        except KeyError:
-            return datetime.fromtimestamp(0)
+        if not self._asset_date:
+            try:
+                timezone_offset = 0
+                if "timeZoneOffset" in self._asset_record["fields"]:
+                    timezone_offset = self._asset_record["fields"]["timeZoneOffset"]["value"]
+                self._asset_date = datetime.fromtimestamp(
+                    self._asset_record["fields"]["assetDate"]["value"] / 1000.0,
+                    tz=dateutil.tz.tzoffset(None, timezone_offset),
+                )
+            except KeyError:
+                self._asset_date = datetime.fromtimestamp(0)
+
+        return self._asset_date
 
     @property
     def added_date(self):
@@ -694,60 +816,82 @@ class PhotoAsset:
         )
 
     @property
-    def versions(self):
+    def item_type(self) -> Optional[AssetItemType]:
+        fields = self._master_record["fields"]
+        if "itemType" not in fields:
+            # raise ValueError(f"Cannot find itemType in {fields!r}")
+            return None
+        item_type_field = fields["itemType"]
+        if "value" not in item_type_field:
+            # raise ValueError(f"Cannot find value in itemType {item_type_field!r}")
+            return None
+        item_type = item_type_field["value"]
+        if item_type in ITEM_TYPES:
+            return ITEM_TYPES[item_type]
+        if self.filename.lower().endswith((".heic", ".png", ".jpg", ".jpeg")):
+            return AssetItemType.IMAGE
+        return AssetItemType.MOVIE
+
+    @property
+    def item_type_extension(self) -> str:
+        fields = self._master_record["fields"]
+        if "itemType" not in fields or "value" not in fields["itemType"]:
+            return "unknown"
+        item_type = self._master_record["fields"]["itemType"]["value"]
+        if item_type in ITEM_TYPE_EXTENSIONS:
+            return ITEM_TYPE_EXTENSIONS[item_type]
+        return "unknown"
+
+    @property
+    def versions(self) -> dict[VersionSize, AssetVersion]:
         """Gets the photo versions."""
         if not self._versions:
-            self._versions = {}
-            if "resVidSmallRes" in self._master_record["fields"]:
-                typed_version_lookup = self.VIDEO_VERSION_LOOKUP
+            self._versions: dict[VersionSize, AssetVersion] = {}
+            if self.item_type == AssetItemType.MOVIE:
+                typed_version_lookup: dict[VersionSize, str] = VIDEO_VERSION_LOOKUP
             else:
-                typed_version_lookup = self.PHOTO_VERSION_LOOKUP
+                typed_version_lookup = PHOTO_VERSION_LOOKUP
 
             for key, prefix in typed_version_lookup.items():
-                if f"{prefix}Res" in self._master_record["fields"]:
+                fields: dict[str, Any] | None = None
+                if f"{prefix}Res" in self._asset_record["fields"]:
+                    fields = self._asset_record["fields"]
+                elif f"{prefix}Res" in self._master_record["fields"]:
                     fields = self._master_record["fields"]
-                    version = {"filename": self.filename}
+                if fields:
+                    version = AssetVersion(self.filename)
 
-                    width_entry = fields.get(f"{prefix}Width")
-                    if width_entry:
-                        version["width"] = width_entry["value"]
-                    else:
-                        version["width"] = None
+                    if width_entry := fields.get(f"{prefix}Width"):
+                        version.width = width_entry["value"]
 
-                    height_entry = fields.get(f"{prefix}Height")
-                    if height_entry:
-                        version["height"] = height_entry["value"]
-                    else:
-                        version["height"] = None
+                    if height_entry := fields.get(f"{prefix}Height"):
+                        version.height = height_entry["value"]
 
-                    size_entry = fields.get(f"{prefix}Res")
-                    if size_entry:
-                        version["size"] = size_entry["value"]["size"]
-                        version["url"] = size_entry["value"]["downloadURL"]
-                    else:
-                        version["size"] = None
-                        version["url"] = None
+                    if size_entry := fields.get(f"{prefix}Res"):
+                        version.size = size_entry["value"]["size"]
+                        version.url = size_entry["value"]["downloadURL"]
+                        version.checksum = size_entry["value"]["fileChecksum"]
 
-                    type_entry = fields.get(f"{prefix}FileType")
-                    if type_entry:
-                        version["type"] = type_entry["value"]
-                    else:
-                        version["type"] = None
+                    if type_entry := fields.get(f"{prefix}FileType"):
+                        version.type = type_entry["value"]
+
+                    filename, extension = os.path.splitext(version.filename)
+                    version.filename = filename + "." + ITEM_TYPE_EXTENSIONS.get(version.type, extension[1:])
 
                     self._versions[key] = version
 
         return self._versions
 
-    def download(self, version="original", **kwargs):
+    def download(self, version: VersionSize = AssetVersionSize.ORIGINAL, **kwargs):
         """Returns the photo file."""
-        if version not in self.versions:
-            return None
+        if (version_obj := self.versions.get(version)) and version_obj.url:
+            return self._service.session.get(
+                version_obj.url,
+                stream=True,
+                **kwargs,
+            )
 
-        return self._service.session.get(
-            self.versions[version]["url"],
-            stream=True,
-            **kwargs,
-        )
+        return None
 
     def delete(self):
         """Deletes the photo."""
