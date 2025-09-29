@@ -882,8 +882,14 @@ class PhotoAsset:
 
         return self._versions
 
-    def download(self, version: VersionSize = AssetVersionSize.ORIGINAL, **kwargs):
+    def download(self, version: VersionSize | AssetVersion = AssetVersionSize.ORIGINAL, **kwargs):
         """Returns the photo file."""
+        if isinstance(version, AssetVersion):
+            return self._service.session.get(
+                version.url,
+                stream=True,
+                **kwargs,
+            )
         if (version_obj := self.versions.get(version)) and version_obj.url:
             return self._service.session.get(
                 version_obj.url,
